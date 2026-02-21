@@ -1,0 +1,138 @@
+name: Build .deb package
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dkms linux-headers-$(uname -r) checkinstall
+
+      - name: Determine version
+        id: version
+        run: |
+          # Read upstream version from the git tag
+          UPSTREAM=$(git tag -l | grep -E '^[0-9]' | sort -V | tail -1)
+          UPSTREAM=${UPSTREAM:-0.1.6}
+          rev=${{ github.run_number }}
+          echo "upstream=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "version=${UPSTREAM}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
+          echo "tag=v${UPSTREAM}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare DKMS source tree
+        run: |
+          VER="${{ steps.version.outputs.upstream }}"
+          SRCDIR="/usr/src/applesmc-next-${VER}"
+
+          # Fix dkms.conf placeholders
+          sed -i "s/@_PKGBASE@/applesmc-next/g; s/@PKGVER@/${VER}/g" dkms.conf
+
+          # Create install script that checkinstall will capture
+          cat > install.sh << 'INSTALL'
+          #!/bin/bash
+          set -e
+          VER="$1"
+          DEST="/usr/src/applesmc-next-${VER}"
+          mkdir -p "$DEST/applesmc" "$DEST/sbs/acpi"
+          cp applesmc/Makefile applesmc/applesmc.c "$DEST/applesmc/"
+          cp sbs/Makefile sbs/sbs.c sbs/sbshc.h "$DEST/sbs/"
+          cp sbs/acpi/sbs.h "$DEST/sbs/acpi/"
+          cp Makefile dkms.conf "$DEST/"
+          INSTALL
+          chmod +x install.sh
+
+      - name: Package with checkinstall
+        run: |
+          VER="${{ steps.version.outputs.upstream }}"
+          sudo checkinstall --default \
+            --pkgname=applesmc-next-dkms \
+            --pkgversion="${{ steps.version.outputs.version }}" \
+            --maintainer="graham@netlinux.co.uk" \
+            --requires="dkms" \
+            --pkggroup="kernel" \
+            --pkgsource="https://github.com/netlinux-ai/applesmc-next" \
+            --pakdir=. \
+            --install=no \
+            --fstrans=yes \
+            ./install.sh "${VER}"
+
+      - name: Repack .deb with DKMS hooks and xz compression
+        run: |
+          VER="${{ steps.version.outputs.upstream }}"
+          DEB=$(ls applesmc-next-dkms_*.deb)
+          sudo chmod 666 "$DEB"
+          mkdir repack && cd repack
+          ar x "../$DEB"
+
+          # Decompress control archive
+          for f in *.zst; do
+            [ -f "$f" ] || continue
+            zstd -d "$f"
+            xz "${f%.zst}"
+            rm "$f"
+          done
+
+          # Add DKMS postinst and prerm scripts
+          mkdir control_extracted
+          tar -xf control.tar.xz -C control_extracted
+
+          cat > control_extracted/postinst << POSTINST
+          #!/bin/bash
+          set -e
+          dkms add -m applesmc-next -v ${VER} 2>/dev/null || true
+          dkms install -m applesmc-next -v ${VER} || true
+          POSTINST
+          chmod 755 control_extracted/postinst
+
+          cat > control_extracted/prerm << PRERM
+          #!/bin/bash
+          set -e
+          dkms remove -m applesmc-next -v ${VER} --all 2>/dev/null || true
+          PRERM
+          chmod 755 control_extracted/prerm
+
+          # Recompress control with scripts added
+          tar -cJf control.tar.xz -C control_extracted .
+
+          rm -rf control_extracted
+          rm "../$DEB"
+          ar rcs "../$DEB" debian-binary control.tar.xz data.tar.xz
+          cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: applesmc-next-dkms ${{ steps.version.outputs.version }}
+          body: |
+            Apple SMC battery charge threshold DKMS modules for Intel MacBooks.
+
+            Automated build from commit ${{ github.sha }}
+
+            Install: `sudo apt install applesmc-next-dkms`
+          files: applesmc-next-dkms_*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify package repository
+        run: |
+          sleep 5
+          SIGNATURE=$(echo -n '{"repo":"netlinux-ai/applesmc-next","tag":"${{ steps.version.outputs.tag }}"}' \
+            | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" -binary \
+            | xxd -p -c 256)
+          curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
+            -d '{"repo":"netlinux-ai/applesmc-next","tag":"${{ steps.version.outputs.tag }}"}' \
+            https://packages.netlinux.co.uk/webhook/update-repo
