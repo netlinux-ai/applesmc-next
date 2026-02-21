@@ -13,16 +13,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y dkms linux-headers-$(uname -r) checkinstall
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Determine version
         id: version
         run: |
-          # Read upstream version from the git tag
           UPSTREAM=$(git tag -l | grep -E '^[0-9]' | sort -V | tail -1)
           UPSTREAM=${UPSTREAM:-0.1.6}
           rev=${{ github.run_number }}
@@ -30,85 +27,61 @@ jobs:
           echo "version=${UPSTREAM}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
           echo "tag=v${UPSTREAM}-${rev}netlinux1" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare DKMS source tree
+      - name: Build .deb
         run: |
           VER="${{ steps.version.outputs.upstream }}"
-          SRCDIR="/usr/src/applesmc-next-${VER}"
+          PKGVER="${{ steps.version.outputs.version }}"
+          PKG="applesmc-next-dkms"
+          DEB="${PKG}_${PKGVER}_all.deb"
 
           # Fix dkms.conf placeholders
           sed -i "s/@_PKGBASE@/applesmc-next/g; s/@PKGVER@/${VER}/g" dkms.conf
 
-          # Create install script that checkinstall will capture
-          cat > install.sh << 'INSTALL'
-          #!/bin/bash
-          set -e
-          VER="$1"
-          DEST="/usr/src/applesmc-next-${VER}"
-          mkdir -p "$DEST/applesmc" "$DEST/sbs/acpi"
-          cp applesmc/Makefile applesmc/applesmc.c "$DEST/applesmc/"
-          cp sbs/Makefile sbs/sbs.c sbs/sbshc.h "$DEST/sbs/"
-          cp sbs/acpi/sbs.h "$DEST/sbs/acpi/"
-          cp Makefile dkms.conf "$DEST/"
-          INSTALL
-          chmod +x install.sh
+          # Build directory structure
+          ROOT="$(pwd)/pkg"
+          SRCDIR="${ROOT}/usr/src/applesmc-next-${VER}"
+          mkdir -p "$SRCDIR/applesmc" "$SRCDIR/sbs/acpi" "${ROOT}/DEBIAN"
 
-      - name: Package with checkinstall
-        run: |
-          VER="${{ steps.version.outputs.upstream }}"
-          sudo checkinstall --default \
-            --pkgname=applesmc-next-dkms \
-            --pkgversion="${{ steps.version.outputs.version }}" \
-            --maintainer="graham@netlinux.co.uk" \
-            --requires="dkms" \
-            --pkggroup="kernel" \
-            --pkgsource="https://github.com/netlinux-ai/applesmc-next" \
-            --pakdir=. \
-            --install=no \
-            --fstrans=yes \
-            ./install.sh "${VER}"
+          cp applesmc/Makefile applesmc/applesmc.c "$SRCDIR/applesmc/"
+          cp sbs/Makefile sbs/sbs.c sbs/sbshc.h "$SRCDIR/sbs/"
+          cp sbs/acpi/sbs.h "$SRCDIR/sbs/acpi/"
+          cp Makefile dkms.conf "$SRCDIR/"
 
-      - name: Repack .deb with DKMS hooks and xz compression
-        run: |
-          VER="${{ steps.version.outputs.upstream }}"
-          DEB=$(ls applesmc-next-dkms_*.deb)
-          sudo chmod 666 "$DEB"
-          mkdir repack && cd repack
-          ar x "../$DEB"
+          # DEBIAN/control
+          cat > "${ROOT}/DEBIAN/control" << EOF
+          Package: ${PKG}
+          Version: ${PKGVER}
+          Architecture: all
+          Maintainer: graham@netlinux.co.uk
+          Depends: dkms
+          Section: kernel
+          Priority: optional
+          Homepage: https://github.com/netlinux-ai/applesmc-next
+          Description: Apple SMC battery charge threshold DKMS modules
+           Out-of-tree kernel modules providing charge_control_end_threshold
+           and charge_control_full_threshold sysfs files for Intel MacBooks.
+           Maps to SMC keys BCLM and BFCL for battery charge limiting.
+          EOF
 
-          # Decompress control archive
-          for f in *.zst; do
-            [ -f "$f" ] || continue
-            zstd -d "$f"
-            xz "${f%.zst}"
-            rm "$f"
-          done
-
-          # Add DKMS postinst and prerm scripts
-          mkdir control_extracted
-          tar -xf control.tar.xz -C control_extracted
-
-          cat > control_extracted/postinst << POSTINST
+          # DEBIAN/postinst
+          cat > "${ROOT}/DEBIAN/postinst" << EOF
           #!/bin/bash
           set -e
           dkms add -m applesmc-next -v ${VER} 2>/dev/null || true
           dkms install -m applesmc-next -v ${VER} || true
-          POSTINST
-          chmod 755 control_extracted/postinst
+          EOF
+          chmod 755 "${ROOT}/DEBIAN/postinst"
 
-          cat > control_extracted/prerm << PRERM
+          # DEBIAN/prerm
+          cat > "${ROOT}/DEBIAN/prerm" << EOF
           #!/bin/bash
           set -e
           dkms remove -m applesmc-next -v ${VER} --all 2>/dev/null || true
-          PRERM
-          chmod 755 control_extracted/prerm
+          EOF
+          chmod 755 "${ROOT}/DEBIAN/prerm"
 
-          # Recompress control with scripts added
-          tar -cJf control.tar.xz -C control_extracted .
-
-          rm -rf control_extracted
-          rm "../$DEB"
-          ar rcs "../$DEB" debian-binary control.tar.xz data.tar.xz
-          cd ..
+          dpkg-deb --build "${ROOT}" "${DEB}"
+          echo "deb=${DEB}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
