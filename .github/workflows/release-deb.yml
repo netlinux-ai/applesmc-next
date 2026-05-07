@@ -26,7 +26,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl git xz-utils zstd
+            ca-certificates curl git xz-utils zstd \
+            build-essential dpkg-dev sudo
 
       - uses: actions/checkout@v4
 
