@@ -1,147 +1,28 @@
-name: Build .deb package (dual-suite)
+name: Trigger dev build
+# All build/test/publish happens on dev (the netlinux nightly host).
+# This GHA workflow is a thin trigger: on every push, sign and POST the
+# commit info to the apt-server webhook, which SSHes to dev and starts
+# a single-repo build for both bookworm and resolute suites.
 
 on:
   push:
-    branches: [main]
-
-permissions:
-  contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: bookworm
-            container: debian:bookworm
-          - target: resolute
-            container: ubuntu:26.04
-    runs-on: ubuntu-24.04
-    container:
-      image: ${{ matrix.container }}
-
+  trigger:
+    runs-on: ubuntu-latest
     steps:
-      - name: Bootstrap container
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            ca-certificates curl git xz-utils zstd \
-            build-essential dpkg-dev sudo
-
-      - uses: actions/checkout@v4
-
-      - name: Determine version
-        id: version
-        run: |
-          UPSTREAM=$(git tag -l | grep -E '^[0-9]' | sort -V | tail -1)
-          UPSTREAM=${UPSTREAM:-0.1.6}
-          rev=${{ github.run_number }}
-          echo "upstream=${UPSTREAM}" >> "$GITHUB_OUTPUT"
-          echo "version=${UPSTREAM}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
-          echo "tag=v${UPSTREAM}-${rev}netlinux1~${{ matrix.target }}1" >> "$GITHUB_OUTPUT"
-
-
-      - name: Build .deb
-        run: |
-          VER="${{ steps.version.outputs.upstream }}"
-          PKGVER="${{ steps.version.outputs.version }}"
-          PKG="applesmc-next-dkms"
-          DEB="${PKG}_${PKGVER}_all.deb"
-
-          # Fix dkms.conf placeholders
-          sed -i "s/@_PKGBASE@/applesmc-next/g; s/@PKGVER@/${VER}/g" dkms.conf
-
-          # Build directory structure
-          ROOT="$(pwd)/pkg"
-          SRCDIR="${ROOT}/usr/src/applesmc-next-${VER}"
-          mkdir -p "$SRCDIR/applesmc" "$SRCDIR/sbs/acpi" "${ROOT}/DEBIAN"
-
-          cp applesmc/Makefile applesmc/applesmc.c "$SRCDIR/applesmc/"
-          cp sbs/Makefile sbs/sbs.c sbs/sbshc.h "$SRCDIR/sbs/"
-          cp sbs/acpi/sbs.h "$SRCDIR/sbs/acpi/"
-          cp Makefile dkms.conf "$SRCDIR/"
-
-          # DEBIAN/control
-          cat > "${ROOT}/DEBIAN/control" << EOF
-          Package: ${PKG}
-          Version: ${PKGVER}
-          Architecture: all
-          Maintainer: graham@netlinux.co.uk
-          Depends: dkms
-          Section: kernel
-          Priority: optional
-          Homepage: https://github.com/netlinux-ai/applesmc-next
-          Description: Apple SMC battery charge threshold DKMS modules
-           Out-of-tree kernel modules providing charge_control_end_threshold
-           and charge_control_full_threshold sysfs files for Intel MacBooks.
-           Maps to SMC keys BCLM and BFCL for battery charge limiting.
-          EOF
-
-          # DEBIAN/postinst
-          cat > "${ROOT}/DEBIAN/postinst" << EOF
-          #!/bin/bash
-          set -e
-          dkms add -m applesmc-next -v ${VER} 2>/dev/null || true
-          dkms install -m applesmc-next -v ${VER} || true
-          EOF
-          chmod 755 "${ROOT}/DEBIAN/postinst"
-
-          # DEBIAN/prerm
-          cat > "${ROOT}/DEBIAN/prerm" << EOF
-          #!/bin/bash
-          set -e
-          dkms remove -m applesmc-next -v ${VER} --all 2>/dev/null || true
-          EOF
-          chmod 755 "${ROOT}/DEBIAN/prerm"
-
-          dpkg-deb --build "${ROOT}" "${DEB}"
-          echo "deb=${DEB}" >> "$GITHUB_OUTPUT"
-
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: deb-${{ matrix.target }}
-          path: |
-            **/*.deb
-          if-no-files-found: error
-
-  release:
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Compute tag
-        id: tag
-        run: echo "tag=v${{ github.run_number }}-dualsuite" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Build ${{ github.run_number }} (bookworm + resolute)
-          body: |
-            Dual-suite build from commit ${{ github.sha }}.
-            Both ~bookworm1 and ~resolute1 .debs are attached.
-          files: artifacts/**/*.deb
-          fail_on_unmatched_files: true
+      - name: Notify dev build pipeline
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Notify package repository
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
-          sleep 5
-          PAYLOAD='{"repo":"netlinux-ai/applesmc-next","tag":"${{ steps.tag.outputs.tag }}"}'
-          SIGNATURE=$(echo -n "$PAYLOAD" \
-            | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" -binary \
-            | xxd -p -c 256)
-          curl -sf -X POST \
+          PAYLOAD=$(printf '{"repo":"%s","sha":"%s","ref":"%s"}' "$REPO" "$SHA" "$REF")
+          SIGNATURE=$(printf %s "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" -binary | xxd -p -c 256)
+          echo "Dispatching build for $REPO @ ${SHA:0:8} ($REF)"
+          curl -sSf -X POST \
             -H "Content-Type: application/json" \
             -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
             -d "$PAYLOAD" \
-            https://packages.netlinux.co.uk/webhook/update-repo
+            https://packages.netlinux.co.uk/webhook/build
