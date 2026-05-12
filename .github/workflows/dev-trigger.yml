@@ -1,0 +1,28 @@
+name: Trigger dev build
+# All build/test/publish happens on dev (the netlinux nightly host).
+# This GHA workflow is a thin trigger: on every push, sign and POST the
+# commit info to the apt-server webhook, which SSHes to dev and starts
+# a single-repo build for both bookworm and resolute suites.
+
+on:
+  push:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify dev build pipeline
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          PAYLOAD=$(printf '{"repo":"%s","sha":"%s","ref":"%s"}' "$REPO" "$SHA" "$REF")
+          SIGNATURE=$(printf %s "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" -binary | xxd -p -c 256)
+          echo "Dispatching build for $REPO @ ${SHA:0:8} ($REF)"
+          curl -sSf -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Signature: sha256=${SIGNATURE}" \
+            -d "$PAYLOAD" \
+            https://packages.netlinux.co.uk/webhook/build
