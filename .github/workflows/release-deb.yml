@@ -1,11 +1,11 @@
-# Build manifest — also replayed by the netlinux dev pipeline.
-# Triggers on every push to main, and can be run manually via the
-# `Run workflow` button (or `gh workflow run release-deb.yml`).
+# Build manifest — replayed by the netlinux dev pipeline.
+# Push-driven builds happen on the dev host (notified by
+# dev-trigger.yml's webhook). This workflow is a manual fallback
+# only: run via the `Run workflow` button or
+# `gh workflow run release-deb.yml` if dev is unavailable.
 name: Build .deb package (dual-suite)
 
 'on':
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
