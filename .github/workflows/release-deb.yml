@@ -1,11 +1,13 @@
-# Build manifest — replayed by the netlinux dev pipeline.
-# Not auto-triggered in GHA; use `gh workflow run release-deb.yml` to
-# run manually on a GitHub-hosted runner.
+# Build manifest — also replayed by the netlinux dev pipeline.
+# Triggers on every push to main, and can be run manually via the
+# `Run workflow` button (or `gh workflow run release-deb.yml`).
 name: Build .deb package (dual-suite)
-true:
+
+'on':
   push:
-    branches:
-    - main
+    branches: [main]
+  workflow_dispatch:
+
 permissions:
   contents: write
 jobs:
@@ -95,5 +97,3 @@ jobs:
         \ -n \"$PAYLOAD\" \\\n  | openssl dgst -sha256 -hmac \"${{ secrets.WEBHOOK_SECRET }}\" -binary \\\n  | xxd -p -c 256)\n\
         curl -sf -X POST \\\n  -H \"Content-Type: application/json\" \\\n  -H \"X-Webhook-Signature: sha256=${SIGNATURE}\"\
         \ \\\n  -d \"$PAYLOAD\" \\\n  https://packages.netlinux.co.uk/webhook/update-repo\n"
-'on':
-  workflow_dispatch: null
