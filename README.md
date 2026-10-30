@@ -77,6 +77,13 @@ sudo dkms add     -m applesmc-next -v 0.1.6
 sudo dkms install -m applesmc-next -v 0.1.6
 ```
 
+```sh
+sudo modprobe -r applesmc sbs           # drop the stock modules
+sudo modprobe sbs                       # load the patched sbs first
+sudo modprobe applesmc                  # then applesmc (it hooks into sbs)
+ls /sys/class/power_supply/BAT0/        # should now contain charge_control_*_threshold
+```
+
 ### From the AUR (Arch)
 
 [`applesmc-next-dkms`](https://aur.archlinux.org/packages/applesmc-next-dkms)
